@@ -1,0 +1,565 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  Calendar as CalendarIcon, 
+  Users, 
+  RefreshCw, 
+  Settings, 
+  ChevronLeft, 
+  ChevronRight, 
+  Plus, 
+  CheckCircle2, 
+  Clock,
+  ArrowRightLeft,
+  LayoutGrid,
+  List,
+  X,
+  MessageSquare,
+  MessageCircle
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  updateDoc, 
+  query, 
+  addDoc,
+  deleteDoc
+} from 'firebase/firestore';
+
+// --- Firebase Configuration ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'oppas-planner-gizan';
+
+const USERS = [
+  { id: 'gizan', name: 'Gizan', color: 'bg-blue-500', text: 'text-blue-600', border: 'border-blue-200' },
+  { id: 'charlotte', name: 'Charlotte', color: 'bg-pink-500', text: 'text-pink-600', border: 'border-pink-200' },
+  { id: 'paula', name: 'Paula', color: 'bg-purple-500', text: 'text-purple-600', border: 'border-purple-200' },
+];
+
+const WEEKDAYS = ['Zo', 'Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za'];
+const MONTHS = ['Januari', 'Februari', 'Maart', 'April', 'Mei', 'Juni', 'Juli', 'Augustus', 'September', 'Oktober', 'November', 'December'];
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [activeTab, setActiveTab] = useState('overzicht');
+  const [viewMode, setViewMode] = useState('week'); 
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [fixedDays, setFixedDays] = useState({}); 
+  const [overrides, setOverrides] = useState([]); 
+  const [swapRequests, setSwapRequests] = useState([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  
+  // Modal State
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [swapReason, setSwapReason] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // 1. Authentication
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Data Fetching
+  useEffect(() => {
+    if (!user) return;
+
+    const fixedDaysRef = collection(db, 'artifacts', appId, 'public', 'data', 'fixedDays');
+    const overridesRef = collection(db, 'artifacts', appId, 'public', 'data', 'overrides');
+    const swapsRef = collection(db, 'artifacts', appId, 'public', 'data', 'swaps');
+
+    const unsubFixed = onSnapshot(fixedDaysRef, (snap) => {
+      const data = {};
+      snap.docs.forEach(doc => data[doc.id] = doc.data().userId);
+      setFixedDays(data);
+    });
+
+    const unsubOverrides = onSnapshot(overridesRef, (snap) => {
+      setOverrides(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    });
+
+    const unsubSwaps = onSnapshot(swapsRef, (snap) => {
+      setSwapRequests(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    });
+
+    return () => {
+      unsubFixed();
+      unsubOverrides();
+      unsubSwaps();
+    };
+  }, [user]);
+
+  const getCaregiver = (date) => {
+    if (!date) return null;
+    const dateStr = date.toISOString().split('T')[0];
+    const override = overrides.find(o => o.date === dateStr);
+    if (override) return USERS.find(u => u.id === override.userId);
+    
+    const dayIndex = date.getDay();
+    const userId = fixedDays[dayIndex];
+    return USERS.find(u => u.id === userId) || null;
+  };
+
+  const getChildSchedule = (date) => {
+    const day = date.getDay();
+    const schedule = { lauren: '', sarah: '' };
+    if (day >= 1 && day <= 5) {
+      schedule.lauren = day === 3 ? '08:30-12:30' : '08:30-15:00';
+    } else {
+      schedule.lauren = 'Vrij';
+    }
+    if (day === 2 || day === 4) {
+      schedule.sarah = 'Creche 09:00-17:00';
+    } else if (day >= 1 && day <= 5) {
+      schedule.sarah = 'Thuis';
+    } else {
+      schedule.sarah = 'Vrij';
+    }
+    return schedule;
+  };
+
+  const sendWhatsAppNotification = (message) => {
+    const encodedMessage = encodeURIComponent(message);
+    const whatsappUrl = `https://wa.me/?text=${encodedMessage}`;
+    window.open(whatsappUrl, '_blank');
+  };
+
+  const handleUpdateFixedDay = async (dayIndex, userId) => {
+    if (!user) return;
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'fixedDays', dayIndex.toString());
+    await setDoc(docRef, { userId });
+  };
+
+  const handleRequestSwap = async () => {
+    if (!user || !selectedDate) return;
+    setIsSubmitting(true);
+    
+    const dateStr = selectedDate.toISOString().split('T')[0];
+    const caregiver = getCaregiver(selectedDate);
+    
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'swaps'), {
+        date: dateStr,
+        fromUserId: caregiver?.id || 'onbekend',
+        reason: swapReason,
+        status: 'pending',
+        timestamp: Date.now()
+      });
+
+      const message = `Hoi! Ik zoek vervanging voor mijn oppasdag op ${selectedDate.toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long' })}. Reden: ${swapReason}. Kan iemand dit overnemen in de app?`;
+      sendWhatsAppNotification(message);
+
+      setSelectedDate(null);
+      setSwapReason('');
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleAcceptSwap = async (swap, takerId) => {
+    if (!user) return;
+    const taker = USERS.find(u => u.id === takerId);
+    const requester = USERS.find(u => u.id === swap.fromUserId);
+    const dateObj = new Date(swap.date);
+
+    try {
+      // 1. Create Override
+      const overrideRef = doc(db, 'artifacts', appId, 'public', 'data', 'overrides', swap.date);
+      await setDoc(overrideRef, { 
+        date: swap.date, 
+        userId: takerId 
+      });
+
+      // 2. Mark swap as completed (or delete)
+      const swapRef = doc(db, 'artifacts', appId, 'public', 'data', 'swaps', swap.id);
+      await deleteDoc(swapRef);
+
+      // 3. Notification
+      const message = `Hoi ${requester?.name}! Ik (${taker?.name}) neem je oppasdag op ${dateObj.toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long' })} over. Het staat in de agenda!`;
+      sendWhatsAppNotification(message);
+
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const syncToGoogle = () => {
+    setIsSyncing(true);
+    setTimeout(() => setIsSyncing(false), 2000);
+  };
+
+  const weekDays = useMemo(() => {
+    const days = [];
+    const start = new Date(currentDate);
+    const day = start.getDay();
+    const diff = start.getDate() - day + (day === 0 ? -6 : 1);
+    start.setDate(diff);
+    for (let i = 0; i < 7; i++) {
+      days.push(new Date(start));
+      start.setDate(start.getDate() + 1);
+    }
+    return days;
+  }, [currentDate]);
+
+  const monthDays = useMemo(() => {
+    const year = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const days = [];
+    const startPadding = firstDay.getDay() === 0 ? 6 : firstDay.getDay() - 1;
+    for (let i = startPadding; i > 0; i--) {
+      days.push({ date: new Date(year, month, 1 - i), currentMonth: false });
+    }
+    for (let i = 1; i <= lastDay.getDate(); i++) {
+      days.push({ date: new Date(year, month, i), currentMonth: true });
+    }
+    const endPadding = 42 - days.length;
+    for (let i = 1; i <= endPadding; i++) {
+      days.push({ date: new Date(year, month + 1, i), currentMonth: false });
+    }
+    return days;
+  }, [currentDate]);
+
+  const changeWeek = (offset) => {
+    const newDate = new Date(currentDate);
+    newDate.setDate(currentDate.getDate() + offset * 7);
+    setCurrentDate(newDate);
+  };
+
+  const changeMonth = (offset) => {
+    const newDate = new Date(currentDate);
+    newDate.setMonth(currentDate.getMonth() + offset);
+    setCurrentDate(newDate);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-24">
+      {/* Modal / Popup voor Ruilen */}
+      {selectedDate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-6 border-b border-slate-100 flex justify-between items-center">
+              <div>
+                <h3 className="text-xl font-black">Vervanging</h3>
+                <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">
+                  {selectedDate.toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long' })}
+                </p>
+              </div>
+              <button onClick={() => setSelectedDate(null)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                <X size={20} className="text-slate-400" />
+              </button>
+            </div>
+            
+            <div className="p-6 space-y-4">
+              <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-2xl border border-slate-100">
+                <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-bold ${getCaregiver(selectedDate)?.color || 'bg-slate-300'}`}>
+                  {getCaregiver(selectedDate)?.name[0] || '?'}
+                </div>
+                <div>
+                  <p className="text-[10px] font-black text-slate-400 uppercase leading-none">Huidige oppas</p>
+                  <p className="text-sm font-bold">{getCaregiver(selectedDate)?.name || 'Geen vaste oppas'}</p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                  <MessageSquare size={12} />
+                  Toelichting
+                </label>
+                <textarea 
+                  value={swapReason}
+                  onChange={(e) => setSwapReason(e.target.value)}
+                  placeholder="Bijv. 'Ik ben dan op vakantie' of 'Ik heb een afspraak'"
+                  className="w-full h-24 p-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:ring-2 focus:ring-orange-500 focus:border-transparent outline-none transition-all resize-none"
+                />
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button 
+                  onClick={() => setSelectedDate(null)}
+                  className="flex-1 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 transition-colors"
+                >
+                  Annuleren
+                </button>
+                <button 
+                  onClick={handleRequestSwap}
+                  disabled={isSubmitting || !getCaregiver(selectedDate)}
+                  className="flex items-center gap-2 bg-orange-500 disabled:opacity-50 text-white px-6 py-3 rounded-2xl text-sm font-black shadow-lg shadow-orange-200 active:scale-95 transition-all"
+                >
+                  <MessageCircle size={16} />
+                  {isSubmitting ? 'Versturen...' : 'Aanvragen'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <header className="bg-white border-b sticky top-0 z-20 px-4 py-4 flex justify-between items-center shadow-sm">
+        <div className="flex items-center gap-2">
+          <div className="bg-orange-500 p-2 rounded-lg text-white">
+            <Users size={20} />
+          </div>
+          <h1 className="text-lg font-bold">Oppas Planner</h1>
+        </div>
+        <button 
+          onClick={syncToGoogle}
+          className="flex items-center gap-2 text-xs font-bold text-slate-600 bg-slate-100 px-3 py-2 rounded-full hover:bg-slate-200 transition-all active:scale-95"
+        >
+          <RefreshCw size={14} className={isSyncing ? "animate-spin" : ""} />
+          {isSyncing ? "Sync..." : "Google Sync"}
+        </button>
+      </header>
+
+      <main className="max-w-md mx-auto p-4 space-y-4">
+        
+        {/* Navigation Tabs */}
+        <div className="flex bg-white rounded-xl p-1 shadow-sm border border-slate-200 sticky top-20 z-10">
+          {[
+            { id: 'overzicht', label: 'Overzicht', icon: <CalendarIcon size={16}/> },
+            { id: 'vaste-dagen', label: 'Instellingen', icon: <Settings size={16}/> },
+            { id: 'ruilen', label: 'Ruilen', icon: <ArrowRightLeft size={16}/> }
+          ].map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex-1 flex flex-col items-center gap-1 py-2 text-[10px] font-bold rounded-lg transition-all ${
+                activeTab === tab.id 
+                ? 'bg-orange-500 text-white shadow-md' 
+                : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {/* View Switcher */}
+        {activeTab === 'overzicht' && (
+          <div className="flex justify-between items-center">
+            <div className="flex bg-slate-200 p-1 rounded-lg">
+              <button onClick={() => setViewMode('week')} className={`p-1.5 rounded-md transition-all ${viewMode === 'week' ? 'bg-white shadow-sm text-orange-600' : 'text-slate-500'}`}><List size={18} /></button>
+              <button onClick={() => setViewMode('month')} className={`p-1.5 rounded-md transition-all ${viewMode === 'month' ? 'bg-white shadow-sm text-orange-600' : 'text-slate-500'}`}><LayoutGrid size={18} /></button>
+            </div>
+            
+            <div className="flex items-center gap-3">
+              <button onClick={() => viewMode === 'week' ? changeWeek(-1) : changeMonth(-1)} className="p-1 hover:bg-white rounded-full border border-slate-200 bg-slate-50"><ChevronLeft size={20} /></button>
+              <span className="text-sm font-bold min-w-[100px] text-center">{viewMode === 'week' ? `Week ${Math.ceil(currentDate.getDate() / 7)}` : `${MONTHS[currentDate.getMonth()]} ${currentDate.getFullYear()}`}</span>
+              <button onClick={() => viewMode === 'week' ? changeWeek(1) : changeMonth(1)} className="p-1 hover:bg-white rounded-full border border-slate-200 bg-slate-50"><ChevronRight size={20} /></button>
+            </div>
+          </div>
+        )}
+
+        {/* Content Tabs */}
+        {activeTab === 'overzicht' && (
+          <div className="space-y-4 animate-in fade-in duration-300">
+            {viewMode === 'week' ? (
+              <div className="space-y-3">
+                {weekDays.map((date, idx) => {
+                  const caregiver = getCaregiver(date);
+                  const schedule = getChildSchedule(date);
+                  const isToday = date.toDateString() === new Date().toDateString();
+                  
+                  return (
+                    <div 
+                      key={idx} 
+                      onClick={() => setSelectedDate(date)}
+                      className={`bg-white rounded-2xl border cursor-pointer active:scale-[0.98] transition-all ${isToday ? 'border-orange-500 ring-2 ring-orange-100' : 'border-slate-200'} p-4 shadow-sm hover:border-orange-200`}
+                    >
+                      <div className="flex justify-between items-start mb-3">
+                        <div>
+                          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{WEEKDAYS[date.getDay()]}</p>
+                          <p className="text-lg font-black">{date.getDate()} {MONTHS[date.getMonth()].slice(0,3)}</p>
+                        </div>
+                        {caregiver ? (
+                          <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-white text-[10px] font-black uppercase ${caregiver.color}`}>
+                            <Users size={12} />
+                            {caregiver.name}
+                          </div>
+                        ) : (
+                          <div className="px-3 py-1 rounded-full bg-slate-50 text-slate-300 text-[10px] font-bold border border-slate-100">
+                            Geen oppas
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 mt-2 pt-3 border-t border-slate-50">
+                        <div className="flex flex-col">
+                          <span className="text-[9px] text-slate-400 font-bold uppercase">Lauren</span>
+                          <span className="text-xs font-semibold text-slate-700">{schedule.lauren}</span>
+                        </div>
+                        <div className="flex flex-col border-l pl-3 border-slate-100">
+                          <span className="text-[9px] text-slate-400 font-bold uppercase">Sarah</span>
+                          <span className="text-xs font-semibold text-slate-700">{schedule.sarah}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="bg-white rounded-2xl border border-slate-200 p-2 shadow-sm">
+                <div className="grid grid-cols-7 mb-2">
+                  {WEEKDAYS.map((d, i) => (
+                    <div key={i} className="text-center text-[10px] font-black text-slate-400 py-2">{d}</div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-7 gap-1">
+                  {monthDays.map((item, idx) => {
+                    const caregiver = getCaregiver(item.date);
+                    const isToday = item.date.toDateString() === new Date().toDateString();
+                    return (
+                      <div 
+                        key={idx} 
+                        onClick={() => setSelectedDate(item.date)}
+                        className={`aspect-square rounded-lg flex flex-col items-center justify-center relative border cursor-pointer transition-all active:scale-90 ${
+                          !item.currentMonth ? 'opacity-20 bg-slate-50' : 'bg-white'
+                        } ${isToday ? 'border-orange-500 ring-1 ring-orange-200' : 'border-slate-100'} hover:border-orange-300`}
+                      >
+                        <span className={`text-[10px] font-bold ${isToday ? 'text-orange-600' : 'text-slate-500'}`}>
+                          {item.date.getDate()}
+                        </span>
+                        {caregiver && (
+                          <div className={`w-1.5 h-1.5 rounded-full mt-1 ${caregiver.color}`} />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'vaste-dagen' && (
+          <div className="space-y-4 animate-in slide-in-from-right duration-300">
+            <div className="bg-blue-50 p-4 rounded-xl border border-blue-100 text-blue-800 text-xs font-medium">
+              Geef hier aan wie de vaste oppas is per weekdag.
+            </div>
+            <div className="space-y-2">
+              {[1, 2, 3, 4, 5].map(dayIndex => (
+                <div key={dayIndex} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
+                  <p className="font-bold text-sm w-12">{WEEKDAYS[dayIndex]}</p>
+                  <div className="flex gap-2">
+                    {USERS.map(u => (
+                      <button
+                        key={u.id}
+                        onClick={() => handleUpdateFixedDay(dayIndex, u.id)}
+                        className={`w-10 h-10 rounded-full flex items-center justify-center text-[10px] font-black transition-all border-2 ${
+                          fixedDays[dayIndex] === u.id 
+                          ? `${u.color} text-white border-transparent scale-110 shadow-lg` 
+                          : 'bg-slate-50 text-slate-400 border-slate-100 hover:border-slate-200'
+                        }`}
+                      >
+                        {u.name[0]}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'ruilen' && (
+          <div className="space-y-4 animate-in slide-in-from-right duration-300">
+             <div className="flex items-center justify-between">
+               <h2 className="text-lg font-bold">Ruilverzoeken</h2>
+               <span className="bg-orange-100 text-orange-600 px-2 py-0.5 rounded text-[10px] font-bold">
+                 {swapRequests.length} Open
+               </span>
+             </div>
+             
+             {swapRequests.length === 0 ? (
+               <div className="bg-white p-10 text-center rounded-2xl border border-dashed border-slate-300">
+                  <p className="text-slate-400 text-sm font-medium">Iedereen kan oppassen op de geplande dagen!</p>
+               </div>
+             ) : (
+               <div className="space-y-3">
+                 {swapRequests.map(swap => {
+                   const requester = USERS.find(u => u.id === swap.fromUserId);
+                   const others = USERS.filter(u => u.id !== swap.fromUserId);
+                   
+                   return (
+                     <div key={swap.id} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                        <div className="flex justify-between items-start">
+                          <div>
+                            <p className="font-black text-sm">{new Date(swap.date).toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'short' })}</p>
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Aanvraag van {requester?.name}</p>
+                          </div>
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white text-[10px] font-bold ${requester?.color}`}>
+                            {requester?.name[0]}
+                          </div>
+                        </div>
+                        
+                        {swap.reason && (
+                          <div className="bg-slate-50 p-3 rounded-xl border border-slate-100">
+                            <p className="text-xs italic text-slate-600">"{swap.reason}"</p>
+                          </div>
+                        )}
+
+                        <div className="space-y-2">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Dag overnemen door...</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            {others.map(other => (
+                              <button 
+                                key={other.id}
+                                onClick={() => handleAcceptSwap(swap, other.id)}
+                                className={`flex items-center justify-center gap-2 py-2.5 rounded-xl text-[11px] font-black text-white shadow-md active:scale-95 transition-all ${other.color}`}
+                              >
+                                {other.name}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                     </div>
+                   );
+                 })}
+               </div>
+             )}
+          </div>
+        )}
+
+      </main>
+
+      <footer className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t border-slate-100 p-4 z-30">
+        <div className="max-w-md mx-auto flex items-center justify-between text-slate-400">
+          <div className="flex items-center gap-3">
+            <div className="bg-orange-100 p-2 rounded-lg text-orange-600"><Clock size={16} /></div>
+            <div>
+              <p className="text-[10px] font-black uppercase leading-none">Status</p>
+              <p className="text-xs font-bold text-slate-700">Live Database</p>
+            </div>
+          </div>
+          <div className="flex -space-x-2">
+            {USERS.map(u => (
+              <div key={u.id} className={`w-8 h-8 rounded-full border-2 border-white flex items-center justify-center text-[10px] font-bold text-white shadow-sm ${u.color}`}>{u.name[0]}</div>
+            ))}
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
